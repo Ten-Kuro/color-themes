@@ -10,12 +10,39 @@ import { PALETTES, PALETTE_CHOICES } from "./CSS/index.js";
 const MODULE_ID = "themes-color";
 const FLAG_KEY  = "themeChoice";
 
+
 // ----------------------------------------------------------------------------
-// Utilities
+// DOM helpers (V12/V13, jQuery/HTMLElement)
+// ----------------------------------------------------------------------------
+
+function resolveHTMLElement(maybeEl) {
+  if (!maybeEl) return null;
+  if (maybeEl instanceof HTMLElement) return maybeEl;
+  if (globalThis.jQuery && maybeEl instanceof jQuery) return maybeEl[0] ?? null;
+  if (Array.isArray(maybeEl)) return maybeEl[0] instanceof HTMLElement ? maybeEl[0] : null;
+  return null;
+}
+
+function getAppId(app, rootEl) {
+  return app?.id || app?.appId || rootEl?.id || null;
+}
+
+function getAppRootElement(app) {
+  const id = app?.id || app?.appId;
+  let el = null;
+  if (id) el = document.getElementById(id);
+  if (!el) el = resolveHTMLElement(app?._element);
+  if (!el) el = resolveHTMLElement(app?.element);
+  return el;
+}
+
+// ----------------------------------------------------------------------------
+// Style injection helpers
 // ----------------------------------------------------------------------------
 
 function removeInjectedStyle(rootEl) {
-  const old = rootEl?.querySelector?.(':scope > style[data-theme-style="1"]');
+  const root = resolveHTMLElement(rootEl);
+  const old = root?.querySelector?.(':scope > style[data-theme-style="1"]');
   if (old) old.remove();
 }
 
@@ -27,12 +54,46 @@ function buildScopedCSS(prefix, pal) {
   const bgText     = pal.bgText      ?? text;
   const inputText  = pal.inputText   ?? text;
   const highlight  = pal.highlight   ?? text;
-  const button     = pal.button      ?? text;
   const panelname  = pal.panelname   ?? text;
   const labeltitle = pal.labeltitle  ?? text;
-  const dice       = pal.dice        ?? text;
+  const hdText     = pal.hdText      ?? text;
 
-  return `
+  // Separate colors
+  const button       = pal.button       ?? text;                       // content buttons
+  const headerButton = pal.headerButton ?? pal.button ?? pal.highlight ?? text; // header controls
+
+   // Background image options (optional)
+  const bgImage     = pal.bgImage     ?? null;
+  const bgSize      = pal.bgSize      ?? "cover";
+  const bgPosition  = pal.bgPosition  ?? "center";
+  const bgRepeat    = pal.bgRepeat    ?? "no-repeat";
+  const bgOpacity   = Number.isFinite(pal.bgOpacity) ? pal.bgOpacity : 0.15;
+  
+  const veilRGBA = (() => {
+  const hex = String(fond).replace("#", "");
+  const to = (i) => parseInt(
+    hex.length === 3 ? hex[i] + hex[i] : hex.slice(i * 2, i * 2 + 2),
+    16
+  );
+  const r = to(0) || 250, g = to(1) || 247, b = to(2) || 234;
+  const a = Math.max(0, Math.min(1, bgOpacity));
+  return `rgba(${r}, ${g}, ${b}, ${a})`;
+  })();
+
+  const contentBackgroundBlock = bgImage ? `
+    background-color: ${fond};
+    background-image:
+      linear-gradient(${veilRGBA}, ${veilRGBA}),
+      url("${bgImage}");
+    background-size: ${bgSize}, ${bgSize};
+    background-position: ${bgPosition}, ${bgPosition};
+    background-repeat: no-repeat, ${bgRepeat};
+  ` : `
+    background: ${fond};
+    background-color: ${fond};
+  `;
+
+return `
     /* Root */
     ${prefix} {
       background: ${fond};
@@ -51,7 +112,7 @@ function buildScopedCSS(prefix, pal) {
     /* Header bar */
     ${prefix} .window-header {
       background: var(--color-header-background, ${ruban});
-      color: ${text};
+      color: ${hdText};
     }
 
     /* Certains systèmes utilisent aussi .application comme conteneur interne */
@@ -78,17 +139,36 @@ function buildScopedCSS(prefix, pal) {
       color: ${highlight};
     }
     
-    /* Rollables: root may itself have .actor-v2 */
-    ${prefix}.actor-v2 .custom-system-rollable,
+    /* Rollables */
+    ${prefix} .custom-system-rollable,
+    ${prefix} a.custom-system-rollable,
     ${prefix} .actor-v2 .custom-system-rollable,
-    ${prefix} .custom-system-rollable {
-      color: ${dice};
+    ${prefix} .actor-v2 a.custom-system-rollable {
+      color: ${highlight};
+      text-decoration-color: ${highlight};
     }
 
-    /* Buttons text color */
-    ${prefix} a.button,
-    ${prefix} button {
+    /* Buttons in content */
+    ${prefix} .window-content a.button,
+    ${prefix} .window-content button {
       color: ${button};
+    }
+
+    /* Table base: fully transparent container */
+    ${prefix} table {
+      background: transparent !important;
+      background-color: transparent !important;
+    }
+
+    /* Keep zebra striping with very low opacity */
+    ${prefix} table tbody tr:nth-child(odd)  td,
+    ${prefix} table tbody tr:nth-child(odd)  th {
+      background-color: rgba(0, 0, 0, 0.06) !important;
+    }
+
+    ${prefix} table tbody tr:nth-child(even) td,
+    ${prefix} table tbody tr:nth-child(even) th {
+      background-color: rgba(0, 0, 0, 0.10) !important;
     }
 
     /* Panel Title */
@@ -100,28 +180,128 @@ function buildScopedCSS(prefix, pal) {
     ${prefix} h3.custom-system-label-root {
       color: ${labeltitle};
     }
-
-    /* Button theme selector */
-    ${prefix} a.header-button {
-        position: absolute;
-        right: 250px;
-    }
   `;
 }
+// ----------------------------------------------------------------------------
+// Robust patches (inline !important) + lightweight observer
+// ----------------------------------------------------------------------------
 
+function setInlineImportant(el, prop, value) {
+  try { el.style.setProperty(prop, value, "important"); } catch (_) {}
+}
 
-/** Apply theme to a single Actor sheet (hot, no full re-render). */
-function applyThemeToApp(app, choice) {
-  if (!app?.actor || !app.rendered) return;
-  const root = app.element;
+function patchRollables(rootEl, pal) {
+  const root = resolveHTMLElement(rootEl);
   if (!root) return;
 
-  const pal = PALETTES[choice]
-           ?? PALETTES.classic
-           ?? Object.values(PALETTES)[0];
+  const highlight = pal?.highlight ?? pal?.text ?? "#EEE";
 
-  // Unique scope per sheet instance + theme choice
-  const themeId = `sheet-${app.id || app.appId || "0"}-${choice}`;
+  const nodes = root.querySelectorAll(
+    ".custom-system-rollable, a.custom-system-rollable, [data-roll], [data-action='roll']"
+  );
+
+  for (const el of nodes) {
+    setInlineImportant(el, "color", highlight);
+    setInlineImportant(el, "text-decoration-color", highlight);
+
+    setInlineImportant(el, "--color-text-hyperlink", highlight);
+    setInlineImportant(el, "--color-text-hyperlink-hover", highlight);
+    setInlineImportant(el, "--color-text-light-highlight", highlight);
+
+    for (const child of el.querySelectorAll("i, svg, span")) {
+      setInlineImportant(child, "color", highlight);
+      setInlineImportant(child, "fill", highlight);
+      setInlineImportant(child, "stroke", highlight);
+    }
+  }
+}
+
+/** Patch ONLY our theme header button (robust vs rerenders/overrides). */
+function patchThemeButton(rootEl, pal) {
+  const root = resolveHTMLElement(rootEl);
+  if (!root) return;
+
+  const c = pal?.headerButton ?? pal?.button ?? pal?.highlight ?? pal?.text ?? "#EEE";
+
+  const btn = root.querySelector('[data-theme-button="1"]');
+  if (!btn) return;
+
+  setInlineImportant(btn, "color", c);
+
+  const icon = btn.querySelector("i, svg");
+  if (icon) {
+    setInlineImportant(icon, "color", c);
+    setInlineImportant(icon, "fill", c);
+    setInlineImportant(icon, "stroke", c);
+  }
+}
+
+const _themeObservers = new Map(); // appId -> MutationObserver
+const _themeObsTimers = new Map(); // appId -> number (throttle)
+
+/** Throttled patch to avoid doing work on every micro-mutation. */
+function schedulePatch(appId, fn) {
+  if (_themeObsTimers.get(appId)) return;
+  const t = window.setTimeout(() => {
+    _themeObsTimers.delete(appId);
+    try { fn(); } catch (_) {}
+  }, 0);
+  _themeObsTimers.set(appId, t);
+}
+
+function detachThemeObserver(appId) {
+  const prev = _themeObservers.get(appId);
+  if (prev) {
+    try { prev.disconnect(); } catch (_) {}
+    _themeObservers.delete(appId);
+  }
+  const timer = _themeObsTimers.get(appId);
+  if (timer) {
+    try { clearTimeout(timer); } catch (_) {}
+    _themeObsTimers.delete(appId);
+  }
+}
+
+function attachThemeObserver(app, rootEl, pal) {
+  const root = resolveHTMLElement(rootEl);
+  if (!app || !root) return;
+
+  const appId = getAppId(app, root);
+  if (!appId) return;
+
+  detachThemeObserver(appId);
+
+  const obs = new MutationObserver(() => {
+    schedulePatch(appId, () => {
+      // keep this minimal: only what we truly need to stay correct
+      patchThemeButton(root, pal);
+      patchRollables(root, pal);
+    });
+  });
+
+  obs.observe(root, { subtree: true, childList: true, attributes: true });
+  _themeObservers.set(appId, obs);
+}
+
+// ----------------------------------------------------------------------------
+// Theme application
+// ----------------------------------------------------------------------------
+
+function applyThemeToApp(app, choice) {
+  if (!app?.actor || !app.rendered) return;
+
+  const root = getAppRootElement(app);
+  if (!root) return;
+
+  const pal = PALETTES?.[choice]
+           ?? PALETTES?.classic
+           ?? Object.values(PALETTES ?? {})[0];
+
+  if (!pal) return;
+
+  const appId = getAppId(app, root) ?? "0";
+
+  const themeId = `sheet-${appId}-${choice}`;
   root.setAttribute("data-theme-id", themeId);
 
   removeInjectedStyle(root);
@@ -134,13 +314,19 @@ function applyThemeToApp(app, choice) {
   style.textContent = buildScopedCSS(prefix, pal);
 
   root.appendChild(style);
+
+  // Ensure the two problematic elements are correct immediately
+  patchThemeButton(root, pal);
+  patchRollables(root, pal);
+
+  // Keep them correct even if the system rerenders/overrides
+  attachThemeObserver(app, root, pal);
 }
 
-/** Resolve theme for an Actor: flag -> "classic" -> first palette key. */
 function getActorThemeChoice(actor) {
   const actorChoice = actor?.getFlag(MODULE_ID, FLAG_KEY);
   const fallback    = "classic";
-  const first       = Object.keys(PALETTE_CHOICES)[0] ?? "classic";
+  const first       = Object.keys(PALETTE_CHOICES ?? {})[0] ?? "classic";
   return actorChoice ?? fallback ?? first;
 }
 
@@ -167,7 +353,7 @@ class ActorThemeForm extends FormApplication {
   async getData() {
     const canEdit = game.user.isGM || this.actor?.isOwner;
     return {
-      choices: canEdit ? PALETTE_CHOICES : {},
+      choices: canEdit ? (PALETTE_CHOICES ?? {}) : {},
       current: getActorThemeChoice(this.actor),
       canEdit
     };
@@ -175,64 +361,95 @@ class ActorThemeForm extends FormApplication {
 
   activateListeners(html) {
     super.activateListeners(html);
-    html.find('[data-action="cancel"]').on("click", () => this.close());
 
-    // Hard-disable if not allowed (double safety with getData)
+    const root = resolveHTMLElement(html) ?? html;
+
+    const cancel = root?.querySelector?.('[data-action="cancel"]');
+    cancel?.addEventListener("click", () => this.close());
+
     if (!game.user.isGM && !this.actor?.isOwner) {
-      html.find("select,button[type=submit]").prop("disabled", true);
+      root?.querySelectorAll?.("select,button[type=submit]")?.forEach(el => {
+        el.disabled = true;
+      });
     }
   }
 
   async _updateObject(_event, formData) {
-    // Permissions check
     if (!game.user.isGM && !this.actor?.isOwner) {
       ui.notifications?.warn("You don't have permission to change this sheet theme.");
       return;
     }
 
-    const value = formData["themeChoice"];
+    const value = formData?.[FLAG_KEY] ?? formData?.themeChoice;
+    if (!value) return;
+
     await this.actor.setFlag(MODULE_ID, FLAG_KEY, value);
 
-    // Hot-apply to any open sheet of this Actor
     for (const app of Object.values(ui.windows)) {
-      if (app?.actor && app.actor.id === this.actor.id && app.rendered) {
+      if (app?.actor?.id === this.actor.id && app.rendered) {
         applyThemeToApp(app, value);
       }
     }
+
     ui.notifications?.info(
-      `Theme set for "${this.actor.name}": ${PALETTE_CHOICES[value] ?? value}`
+      `Theme set for "${this.actor.name}": ${PALETTE_CHOICES?.[value] ?? value}`
     );
   }
 }
 
 // ----------------------------------------------------------------------------
-// Header button — added as the very first element (left-most). Visible to GM/owner.
+// Header button — visible to GM/owner.
+// IMPORTANT: we do NOT rely on one-shot inline styling here.
+// The reliable color enforcement is done by patchThemeButton + observer.
 // ----------------------------------------------------------------------------
 
 function injectHeaderButton(app) {
   if (!app?.actor) return;
-  const root = app.element;
+  if (!(game.user?.isGM || app.actor?.isOwner)) return;
+
+  const root = getAppRootElement(app);
   if (!root) return;
 
-  const header = root.querySelector(".window-header");
+  // We try the classic place first, but do not assume where Foundry puts controls.
+  const header = root.querySelector?.(".window-header") || root.querySelector?.(".window-titlebar") || root;
   if (!header) return;
 
-  // Only GM or Actor owner can see the button
-  const canEditTheme = game.user.isGM || app.actor.isOwner;
-  if (!canEditTheme) return;
+  const appId = getAppId(app, root) ?? "0";
+  const domID = `fs-theme-btn-${appId}`;
 
-  // Avoid duplicates
-  if (header.querySelector('[data-theme-button="1"]')) return;
+  if (root.querySelector(`#${domID}, [data-theme-button="1"]`)) return;
 
-  const btn = document.createElement("a");
+  const closeButton =
+    root.querySelector('.window-header [data-action="close"]') ||
+    root.querySelector('.window-titlebar [data-action="close"]') ||
+    header.querySelector?.('[data-action="close"]');
+
+  const btn = document.createElement("button");
+  btn.id = domID;
+  btn.type = "button";
   btn.setAttribute("data-theme-button", "1");
-  btn.classList.add("header-button");
-  btn.title = "Choose Sheet Theme";
+  btn.className = "header-control icon";
+  btn.setAttribute("data-tooltip", "Choose Sheet Theme");
   btn.innerHTML = `<i class="fas fa-palette"></i>`;
   btn.addEventListener("click", () => new ActorThemeForm(app.actor).render(true));
 
-  // Insert as the very first child of the header (left-most)
-  header.insertBefore(btn, header.firstChild);
+  if (closeButton?.parentNode) {
+    closeButton.parentNode.insertBefore(btn, closeButton);
+  } else {
+    const title =
+      root.querySelector(".window-header .window-title") ||
+      root.querySelector(".window-titlebar .window-title") ||
+      header.querySelector?.(".window-title");
+    if (title?.parentNode) title.parentNode.insertBefore(btn, title.nextSibling);
+    else header.appendChild(btn);
+  }
+
+  // Immediately enforce correct color (and observer will keep it correct)
+  try {
+    const choice = getActorThemeChoice(app.actor);
+    const pal = PALETTES?.[choice] ?? PALETTES?.classic ?? Object.values(PALETTES ?? {})[0];
+    patchThemeButton(root, pal);
+  } catch (_) {}
 }
 
 // ----------------------------------------------------------------------------
@@ -241,7 +458,7 @@ function injectHeaderButton(app) {
 
 Hooks.on("renderApplicationV2", (app) => {
   try {
-    if (!app.actor) return; // only Actor sheets
+    if (!app?.actor) return;
 
     const choice = getActorThemeChoice(app.actor);
     applyThemeToApp(app, choice);
@@ -251,12 +468,19 @@ Hooks.on("renderApplicationV2", (app) => {
   }
 });
 
+Hooks.on("closeApplicationV2", (app) => {
+  try {
+    const root = getAppRootElement(app);
+    const appId = getAppId(app, root);
+    if (appId) detachThemeObserver(appId);
+  } catch (_) {}
+});
+
 Hooks.on("updateActor", (actor, changes) => {
-  // If the Actor's theme flag changed, update any open sheets for that Actor
   if (!foundry.utils.hasProperty(changes, `flags.${MODULE_ID}.${FLAG_KEY}`)) return;
 
   for (const app of Object.values(ui.windows)) {
-    if (app?.actor && app.actor.id === actor.id && app.rendered) {
+    if (app?.actor?.id === actor.id && app.rendered) {
       const choice = actor.getFlag(MODULE_ID, FLAG_KEY);
       applyThemeToApp(app, choice);
     }
